@@ -2254,31 +2254,79 @@ def _ensure_movement_session() -> None:
     st.session_state["sharp_movements_v2"] = flat
 
 
-def _parse_odds_line(
+def _parse_odds_row(
     market: str,
     text: str,
 ) -> tuple[Optional[Dict[str, Any]], str]:
     """
-    One row of the text table -> one line record.
+    Parse one row of either the opening or closing table.
 
-      OU / AH  ->  "line over under"   e.g. "2.5 1.9 1.9"
-      1X2/HHAD ->  "home draw away"    e.g. "2.1 3.4 3.2"
+    Short form (3 values, legacy / opening-only):
+        OU/AH  -> "line over under"        e.g. "2.5 1.9 1.9"
+        1X2    -> "home draw away"         e.g. "2.1 3.4 3.2"
 
-    Returns (record or None, error message).
+    Full form (opening + closing in one row):
+        OU/AH  -> "line o_open o_close u_open u_close"
+                   e.g. "2.5 1.90 2.05 1.90 1.80"
+        1X2    -> "h_o h_c d_o d_c a_o a_c"
+                   e.g. "2.10 2.05 3.40 3.60 3.20 3.40"
+
+    Returns (record or None, error message). When the short form
+    is used, opening and closing are set to the same values.
     """
 
     if market in {"1X2", "HHAD"}:
-        required = 3
-        labels = ["home", "draw", "away"]
+        short, full = 3, 6
+        full_labels = [
+            "home_open", "home_close",
+            "draw_open", "draw_close",
+            "away_open", "away_close",
+        ]
     else:
-        required = 3
-        labels = ["line", "over", "under"]
+        short, full = 3, 5
+        full_labels = [
+            "line",
+            "over_open", "over_close",
+            "under_open", "under_close",
+        ]
 
-    parts = text.split()
-    if len(parts) != required:
+    parts = [x for x in text.split() if x]
+
+    if len(parts) == short:
+        nums: list[float] = []
+        for i, part in enumerate(parts):
+            try:
+                nums.append(float(part))
+            except ValueError:
+                return (
+                    None,
+                    f"第 {i + 1} 個「{part}」不是有效數字",
+                )
+
+        if market in {"1X2", "HHAD"}:
+            return {
+                "line": None,
+                "open_home": nums[0],
+                "close_home": nums[0],
+                "open_draw": nums[1],
+                "close_draw": nums[1],
+                "open_away": nums[2],
+                "close_away": nums[2],
+            }, ""
+
+        return {
+            "line": nums[0],
+            "open_over": nums[1],
+            "close_over": nums[1],
+            "open_under": nums[2],
+            "close_under": nums[2],
+        }, ""
+
+    if len(parts) != full:
         return (
             None,
-            f"需要 {required} 個數值（{', '.join(labels)}），"
+            f"需要 {full} 個數值（{', '.join(full_labels)}），"
+            f"或 {short} 個（只填初盤，尾盤會自動沿用）；"
             f"收到 {len(parts)} 個",
         )
 
@@ -2296,27 +2344,226 @@ def _parse_odds_line(
         return {
             "line": None,
             "open_home": nums[0],
-            "close_home": nums[0],
-            "open_draw": nums[1],
-            "close_draw": nums[1],
-            "open_away": nums[2],
-            "close_away": nums[2],
+            "close_home": nums[1],
+            "open_draw": nums[2],
+            "close_draw": nums[3],
+            "open_away": nums[4],
+            "close_away": nums[5],
         }, ""
 
     return {
         "line": nums[0],
         "open_over": nums[1],
-        "close_over": nums[1],
-        "open_under": nums[2],
-        "close_under": nums[2],
+        "close_over": nums[2],
+        "open_under": nums[3],
+        "close_under": nums[4],
     }, ""
 
 
-def _line_to_text(
+def _market_block_editor(
+    *,
+    period: str,
+    market: str,
+    line_records: list,
+    odds_format: str,
+    key_prefix: str,
+    show_bookmaker: bool = False,
+    bookmaker: str = "",
+) -> tuple[list, str, str, bool]:
+    """
+    Two side-by-side text tables: opening (left) and closing (right).
+    Each row is one line.
+
+      2-way full form (5 values):
+        line  over_open  over_close  under_open  under_close
+        e.g. 2.5   1.90  2.05  1.90  1.80
+
+      3-way full form (6 values):
+        home_o  home_c  draw_o  draw_c  away_o  away_c
+        e.g. 2.10  2.05  3.40  3.60  3.20  3.40
+
+    Legacy short form (3 values) is still accepted: the same
+    values are copied into both opening and closing.
+    """
+
+    if market in {"1X2", "HHAD"}:
+        caption = (
+            "每行一條：home_open  home_close  "
+            "draw_open  draw_close  away_open  away_close"
+        )
+        placeholder_open = "2.10  2.10  3.40  3.40  3.20  3.20"
+        placeholder_close = "2.05  2.05  3.60  3.60  3.40  3.40"
+    else:
+        caption = (
+            "每行一條：line  over_open  over_close  "
+            "under_open  under_close"
+        )
+        placeholder_open = "2.50  1.90  1.90  1.90  1.90"
+        placeholder_close = "2.50  2.05  2.05  1.80  1.80"
+
+    st.caption(caption)
+
+    col_open, col_close = st.columns(2)
+
+    with col_open:
+        st.markdown("**初盤**")
+        examples_open = "\n".join(
+            _record_to_text_open(market, r)
+            for r in line_records
+        )
+        raw_open = st.text_area(
+            label="初盤 lines（每行一條）",
+            value=examples_open,
+            height=max(
+                80, 32 * max(2, len(line_records) + 1)
+            ),
+            key=f"{key_prefix}_open_txt",
+            placeholder=placeholder_open,
+            label_visibility="collapsed",
+        )
+
+    with col_close:
+        st.markdown("**尾盤**")
+        examples_close = "\n".join(
+            _record_to_text_close(market, r)
+            for r in line_records
+        )
+        raw_close = st.text_area(
+            label="尾盤 lines（每行一條）",
+            value=examples_close,
+            height=max(
+                80, 32 * max(2, len(line_records) + 1)
+            ),
+            key=f"{key_prefix}_close_txt",
+            placeholder=placeholder_close,
+            label_visibility="collapsed",
+        )
+
+    # ---- parse opening table ----
+    open_rows: list = []
+    open_index: dict = {}
+
+    for lineno, line in enumerate(
+        raw_open.splitlines(), start=1
+    ):
+        text = line.strip()
+        if not text:
+            continue
+
+        rec, err = _parse_odds_row(
+            market, text
+        )
+
+        if err:
+            st.error(
+                f"初盤 第 {lineno} 行：「{text}」— {err}"
+            )
+            continue
+
+        open_rows.append(rec)
+        # index by line value so we can pair with closing
+        open_index[_record_line_key(market, rec)] = rec
+
+    # ---- parse closing table, merge into opening rows ----
+    parsed: list = []
+    used_open_keys = set()
+
+    for lineno, line in enumerate(
+        raw_close.splitlines(), start=1
+    ):
+        text = line.strip()
+        if not text:
+            continue
+
+        rec, err = _parse_odds_row(
+            market, text
+        )
+
+        if err:
+            st.error(
+                f"尾盤 第 {lineno} 行：「{text}」— {err}"
+            )
+            continue
+
+        key = _record_line_key(market, rec)
+        base = open_index.get(key)
+
+        if base is not None:
+            # 保留初盤，覆蓋尾盤
+            base["close_over"] = rec.get(
+                "close_over", base.get("close_over")
+            )
+            base["close_under"] = rec.get(
+                "close_under", base.get("close_under")
+            )
+            base["close_home"] = rec.get(
+                "close_home", base.get("close_home")
+            )
+            base["close_draw"] = rec.get(
+                "close_draw", base.get("close_draw")
+            )
+            base["close_away"] = rec.get(
+                "close_away", base.get("close_away")
+            )
+            parsed.append(base)
+            used_open_keys.add(key)
+        else:
+            # 尾盤有這條但初盤沒填：把尾盤值同時當初盤
+            if "open_over" in rec:
+                rec["open_over"] = rec.get(
+                    "open_over", rec.get("close_over")
+                )
+                rec["open_under"] = rec.get(
+                    "open_under", rec.get("close_under")
+                )
+            else:
+                rec["open_home"] = rec.get(
+                    "open_home", rec.get("close_home")
+                )
+                rec["open_draw"] = rec.get(
+                    "open_draw", rec.get("close_draw")
+                )
+                rec["open_away"] = rec.get(
+                    "open_away", rec.get("close_away")
+                )
+            parsed.append(rec)
+
+    # 初盤有但尾盤沒填的行：保留（初盤=尾盤已在解析時設好）
+    for rec in open_rows:
+        key = _record_line_key(market, rec)
+        if key not in used_open_keys:
+            parsed.append(rec)
+
+    if not parsed:
+        parsed = [
+            _default_line_record(
+                market,
+                2.50 if market not in {
+                    "1X2", "HHAD"
+                } else 0.0,
+            )
+        ]
+
+    return parsed, odds_format, bookmaker, False
+
+
+def _record_line_key(
     market: str,
     record: Dict[str, Any],
 ) -> str:
-    """Serialize one record back to the text-table format."""
+    """A stable key for pairing opening/close rows by line."""
+
+    if market in {"1X2", "HHAD"}:
+        return "3way"
+
+    return f'{safe_float(record.get("line"), 0.0):.2f}'
+
+
+def _record_to_text_open(
+    market: str,
+    record: Dict[str, Any],
+) -> str:
+    """Opening-only projection for display."""
 
     if not isinstance(record, dict):
         return ""
@@ -2339,98 +2586,31 @@ def _line_to_text(
     ]).strip()
 
 
-def _next_entry_id() -> int:
-    """Return a monotonically increasing id stored on the session."""
-
-    ss = st.session_state
-    ss.setdefault("_mv_entry_seq", 0)
-    ss["_mv_entry_seq"] += 1
-
-    return ss["_mv_entry_seq"]
-
-
-def _pending_deletes(
-    period: str,
-) -> list:
-    """Ids queued for deletion in this period; flushed after render."""
-
-    key = f"_mv_pending_del_{period}"
-    st.session_state.setdefault(key, [])
-
-    return st.session_state[key]
-
-
-def _market_block_editor(
-    *,
-    period: str,
+def _record_to_text_close(
     market: str,
-    line_records: list,
-    odds_format: str,
-    key_prefix: str,
-    show_bookmaker: bool = False,
-    bookmaker: str = "",
-) -> tuple[list, str, str, bool]:
-    """
-    A text-input table: one line per row.
-      OU / AH  ->  "line over under"   e.g. "2.5 1.9 1.9"
-      1X2/HHAD ->  "home draw away"    e.g. "2.1 3.4 3.2"
-    """
+    record: Dict[str, Any],
+) -> str:
+    """Closing-only projection for display."""
+
+    if not isinstance(record, dict):
+        return ""
+
+    def g(field: str) -> str:
+        v = safe_float(record.get(field))
+        return f"{v:.2f}" if v is not None else ""
 
     if market in {"1X2", "HHAD"}:
-        header = "格式：home  draw  away"
-        placeholder = "2.10  3.40  3.20"
-    else:
-        header = "格式：line  over  under"
-        placeholder = "2.50  1.90  1.90"
+        return "  ".join([
+            g("close_home"),
+            g("close_draw"),
+            g("close_away"),
+        ]).strip()
 
-    st.caption(header)
-
-    examples = "\n".join(
-        _line_to_text(market, r) for r in line_records
-    )
-
-    raw = st.text_area(
-        label="lines（每行一條）",
-        value=examples,
-        height=max(80, 32 * max(2, len(line_records) + 1)),
-        key=f"{key_prefix}_txt",
-        placeholder=placeholder,
-        label_visibility="collapsed",
-    )
-
-    parsed: list = []
-    for lineno, line in enumerate(
-        raw.splitlines(), start=1
-    ):
-        text = line.strip()
-
-        if not text:
-            continue
-
-        record, err = _parse_odds_line(
-            market, text
-        )
-
-        if err:
-            st.error(
-                f"第 {lineno} 行：「{text}」— {err}"
-            )
-            continue
-
-        parsed.append(record)
-
-    if not parsed:
-        # 使用者清空內容時保留一筆樣板，介面才不會消失。
-        parsed = [
-            _default_line_record(
-                market,
-                2.50 if market not in {
-                    "1X2", "HHAD"
-                } else 0.0,
-            )
-        ]
-
-    return parsed, odds_format, bookmaker, False
+    return "  ".join([
+        f'{safe_float(record.get("line"), 0.0):.2f}',
+        g("close_over"),
+        g("close_under"),
+    ]).strip()
 
 
 def _period_section(
@@ -2679,17 +2859,31 @@ def _record_has_odds(
     market: str,
     record: Dict[str, Any],
 ) -> bool:
-    """A record is usable only when it has real odds."""
+    """
+    A record is usable only when both opening and closing
+    odds are present and positive on every outcome. A row with
+    only opening or only closing filled is not a valid movement.
+    """
 
     if not isinstance(record, dict):
         return False
 
     if market in {"1X2", "HHAD"}:
-        fields = ["open_home", "open_draw", "open_away"]
+        fields = [
+            "open_home", "close_home",
+            "open_draw", "close_draw",
+            "open_away", "close_away",
+        ]
     elif market == "AH":
-        fields = ["open_home", "open_away"]
+        fields = [
+            "open_home", "close_home",
+            "open_away", "close_away",
+        ]
     else:
-        fields = ["open_over", "open_under"]
+        fields = [
+            "open_over", "close_over",
+            "open_under", "close_under",
+        ]
 
     for f in fields:
         if safe_float(record.get(f)) in (None, 0.0):
@@ -2729,11 +2923,14 @@ def _build_series_from_record(
         o = safe_float(
             record.get(f"open_{side}")
         )
-
         c = safe_float(
             record.get(f"close_{side}")
         )
 
+        # _record_has_odds already guarantees both are present
+        # and positive, but keep a defensive guard here so that
+        # a manually built record never produces a half-formed
+        # series.
         if o is None or c is None or o <= 0 or c <= 0:
             return None
 
