@@ -80,10 +80,32 @@ PRIOR_FIT_MAX_EVALUATIONS = 350
 
 # ============================================================
 # 1. Preserve original V2 functions across Streamlit reloads
+#
+# Streamlit re-imports this module on every code change. The
+# injection below must therefore be re-entrant: reloading V2
+# creates fresh function objects, so reloading V3 must re-snapshot
+# them and re-install the V3 replacements. A one-shot guard would
+# leave V2 calling a stale function object after reload.
 # ============================================================
 
-if not hasattr(v2, "__aegis_v3_originals__"):
-    v2.__aegis_v3_originals__ = {
+_V3_MARKER = "__aegis_v3_originals__"
+
+
+def _snapshot_originals():
+    """
+    Capture the *current* V2 function objects before V3 overwrites
+    them. Idempotent: safe to call on first import and on every
+    subsequent reload.
+    """
+
+    # If V3 is already installed, the "originals" we want are the
+    # V2 functions that existed before the first installation.
+    # Those are exactly what we saved on the first pass, so keep
+    # them -- do not overwrite with V3's own replacements.
+    if hasattr(v2, _V3_MARKER):
+        return v2.__aegis_v3_originals__
+
+    return {
         "validate_input_data": v2.validate_input_data,
         "run_engine": v2.run_engine,
         "devig_probabilities": v2.devig_probabilities,
@@ -92,6 +114,11 @@ if not hasattr(v2, "__aegis_v3_originals__"):
             v2.evaluate_model_scenarios
         ),
     }
+
+
+v2.__aegis_v3_originals__ = (
+    _snapshot_originals()
+)
 
 
 _ORIGINALS = v2.__aegis_v3_originals__
@@ -108,6 +135,36 @@ _original_run_engine = _ORIGINALS[
 # Make V2-generated metadata identify the upgraded engine.
 v2.ENGINE_NAME = ENGINE_NAME
 v2.ENGINE_VERSION = ENGINE_VERSION
+
+
+def _install_v3_replacements():
+    """
+    Inject the V3 replacements into V2's namespace. Called on
+    first import AND on every reload so the wiring is never left
+    in a half-upgraded state.
+    """
+
+    v2.devig_probabilities = (
+        devig_probabilities
+    )
+
+    v2.validate_input_data = (
+        validate_input_data
+    )
+
+    v2.build_market_model = (
+        build_market_model
+    )
+
+    v2.evaluate_model_scenarios = (
+        evaluate_model_scenarios
+    )
+
+
+# NOTE: _install_v3_replacements() is invoked at the bottom of
+# this module, after every V3 function it references has been
+# defined. A module-level call here would fail with NameError
+# because those functions appear later in the file.
 
 
 # ============================================================
@@ -911,19 +968,7 @@ def _public_prior_diagnostics(
 def build_market_model(
     constraints,
     max_goals,
-    marginal_distribution="DIXON_COLES",
 ):
-    """
-    Build a market model with optional marginal distribution.
-
-    marginal_distribution options:
-      - "DIXON_COLES" (default): Standard Dixon-Coles prior
-        with Poisson marginals + low-score correction.
-      - "COM_POISSON": Dixon-Coles low-score correction
-        applied to COM-Poisson marginals (thinner tails
-        when dispersion > 1).
-    """
-
     if not v2.validate_constraint_subset(
         constraints
     ):
@@ -932,7 +977,7 @@ def build_market_model(
         )
 
     # --------------------------------------------------------
-    # Baseline prior: Dixon-Coles (always fitted)
+    # Baseline prior: Dixon-Coles
     # --------------------------------------------------------
 
     dixon_coles_fit = (
@@ -941,21 +986,6 @@ def build_market_model(
             max_goals,
         )
     )
-
-    # --------------------------------------------------------
-    # Optional COM-Poisson marginal enhancement
-    # --------------------------------------------------------
-
-    com_poisson_fit = None
-
-    if marginal_distribution == "COM_POISSON":
-        try:
-            com_poisson_fit = fit_com_poisson_prior(
-                constraints,
-                max_goals,
-            )
-        except Exception:
-            com_poisson_fit = None
 
     prior_fits: Dict[
         str,
@@ -1049,28 +1079,8 @@ def build_market_model(
         ] = str(error)
 
     # --------------------------------------------------------
-    # Projection baseline selection
+    # Projection always starts from Dixon-Coles.
     # --------------------------------------------------------
-    # When COM_POISSON marginal is requested, use the
-    # COM-Poisson prior probabilities as the entropy-
-    # projection baseline instead of Dixon-Coles. This
-    # makes high-goal tails thinner (dispersion > 1),
-    # improving O/U 3.5, correct scores, and high-line
-    # AH valuations.
-
-    if (
-        marginal_distribution == "COM_POISSON"
-        and com_poisson_fit is not None
-    ):
-        projection_baseline = "COM_POISSON"
-        baseline_probabilities = com_poisson_fit[
-            "probabilities"
-        ]
-    else:
-        projection_baseline = "DIXON_COLES"
-        baseline_probabilities = dixon_coles_fit[
-            "probabilities"
-        ]
 
     enriched, matrix, targets = (
         v2.enrich_constraints(
@@ -1080,7 +1090,9 @@ def build_market_model(
     )
 
     projection = v2.entropy_projection(
-        baseline_probabilities,
+        dixon_coles_fit[
+            "probabilities"
+        ],
         matrix,
         targets,
     )
@@ -1152,12 +1164,7 @@ def build_market_model(
             "projection_method"
         ],
         "projection_baseline_prior": (
-            projection_baseline
-        ),
-        "com_poisson_prior": (
-            com_poisson_fit
-            if com_poisson_fit is not None
-            else None
+            "DIXON_COLES"
         ),
         "constraint_count": len(
             constraints
@@ -3510,27 +3517,6 @@ def attach_movement_analysis(
 
 
 # ============================================================
-# 10. Install V3 extensions into V2 execution namespace
-# ============================================================
-
-v2.devig_probabilities = (
-    devig_probabilities
-)
-
-v2.validate_input_data = (
-    validate_input_data
-)
-
-v2.build_market_model = (
-    build_market_model
-)
-
-v2.evaluate_model_scenarios = (
-    evaluate_model_scenarios
-)
-
-
-# ============================================================
 # 11. Public V3 engine entry point
 # ============================================================
 
@@ -3581,12 +3567,7 @@ def run_engine(
 
     methodology.update({
         "projection_baseline_prior": (
-            projection_baseline
-        ),
-        "com_poisson_prior": (
-            com_poisson_fit
-            if com_poisson_fit is not None
-            else None
+            "DIXON_COLES"
         ),
         "pre_projection_prior_comparison": [
             "DIXON_COLES",
@@ -3672,3 +3653,14 @@ def __getattr__(
         v2,
         name,
     )
+
+
+# ============================================================
+# 13. Finalize V2 injection
+#
+# Must run after every V3 replacement function has been defined,
+# and on every reload, so V2's namespace is always wired to the
+# current V3 implementations.
+# ============================================================
+
+_install_v3_replacements()
