@@ -56,6 +56,10 @@ aegis = importlib.reload(
 # Sanity check: confirm V3's snapshot actually points at V2's
 # originals and not at a stale or self-referential object. If this
 # fails, every engine run will misbehave silently.
+#
+# NOTE: st.error / st.warning may not be called here because
+# set_page_config has not run yet. Stash the result in
+# session_state and surface it after the page config instead.
 try:
     _v3_originals = getattr(
         aegis_v2,
@@ -87,10 +91,16 @@ try:
             "V3 original-validate probe returned falsy."
         )
 
-except Exception as _reload_check_error:
-    st.error(
-        f"引擎 reload 檢查失敗：{_reload_check_error}"
+    st.session_state["_reload_check_ok"] = True
+    st.session_state.pop(
+        "_reload_check_error",
+        None,
     )
+
+except Exception as _reload_check_error:
+    st.session_state[
+        "_reload_check_error"
+    ] = str(_reload_check_error)
 
 
 APP_NAME = "AEGIS ULTRA"
@@ -138,6 +148,18 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+
+# Surface the reload sanity-check result now that set_page_config
+# has run (calling st.error before it is forbidden).
+_reload_error = st.session_state.get(
+    "_reload_check_error"
+)
+
+if _reload_error:
+    st.error(
+        f"引擎 reload 檢查失敗：{_reload_error}"
+    )
 
 
 # ============================================================
@@ -2258,8 +2280,21 @@ with input_tab:
         "odds_movements 可留空。"
     )
 
+    # If a recent injection queued a new value, surface it here
+    # through the `value` parameter instead of assigning to the
+    # widget's own key (that raises
+    # StreamlitWidgetAlreadyInstantiatedError).
+    _pending = st.session_state.pop(
+        "mv_inject_pending",
+        None,
+    )
+
+    if _pending is not None:
+        st.session_state["json_input"] = _pending
+
     json_input = st.text_area(
         "AEGIS ULTRA V3 輸入",
+        value=st.session_state.get("json_input", ""),
         key="json_input",
         height=680,
     )
@@ -2345,355 +2380,726 @@ with movement_help_tab:
         "填完後按「生成 odds_movements JSON」。"
     )
 
-    # ---- Pinnacle Movement ----
-    st.subheader("📌 Pinnacle Movement（基準走勢）")
-    st.caption(
-        "HKJC 開什麼 line，就在 oddshub 找 Pinnacle "
-        "同一條 line 的初盤和尾盤。"
-        "需要填寫 market 兩邊的完整 odds。"
-    )
+    # ============================================================
+    # Helpers for the new text-input-table form
+    # ============================================================
 
-    pin_market_type = st.selectbox(
-        "Pinnacle 市場類型",
-        ["2-way (OU / AH)", "3-way (1X2 / HHAD)"],
-        key="pin_market_type",
-    )
+    def _parse_line_row(
+        text: str,
+        market: str,
+    ) -> List[Dict[str, float]]:
+        """
+        Parse a text area into a list of line-records.
 
-    if pin_market_type.startswith("2"):
-        # OU or AH: need over/under or home/away odds
-        pin_sub_market = st.selectbox(
-            "市場",
-            ["OU", "AH"],
-            key="pin_sub_market",
+        OU / AH:  "line over under"        -> ["line","over","under"]
+        1X2/HHAD: "home draw away"        -> ["home","draw","away"]
+
+        Each line of text is one record. Returns [] if the text is
+        empty. Raises ValueError listing the offending line numbers
+        when a row cannot be parsed.
+        """
+
+        records: List[Dict[str, float]] = []
+
+        keys = (
+            ["line", "over", "under"]
+            if market in {"OU", "AH"}
+            else ["home", "draw", "away"]
         )
 
-        pin_line = st.number_input(
-            "Line（HKJC 開的盤）",
-            value=2.75,
-            step=0.25,
-            key="pin_line_val",
-            help="例如 2.5, 2.75, 3.0",
+        for index, raw in enumerate(
+            text.splitlines(),
+            start=1,
+        ):
+            line = raw.strip()
+
+            if not line:
+                continue
+
+            tokens = line.split()
+
+            if len(tokens) != len(keys):
+                raise ValueError(
+                    f"第 {index} 行需要 {len(keys)} 個數值 "
+                    f"({market} 格式：{' '.join(keys)})"
+                    f"，但收到 {len(tokens)} 個。"
+                )
+
+            record: Dict[str, float] = {}
+
+            for key, token in zip(keys, tokens):
+                try:
+                    record[key] = float(token)
+                except ValueError:
+                    raise ValueError(
+                        f"第 {index} 行「{token}」不是有效數字。"
+                    )
+
+            records.append(record)
+
+        return records
+
+    def _line_records_to_text(
+        records: List[Dict[str, float]],
+        market: str,
+    ) -> str:
+        """Inverse of _parse_line_row. Survives an empty list."""
+
+        keys = (
+            ["line", "over", "under"]
+            if market in {"OU", "AH"}
+            else ["home", "draw", "away"]
         )
 
-        st.write("**初盤**")
-        pin_open_cols = st.columns(2)
-        with pin_open_cols[0]:
-            pin_open_a = st.number_input(
-                "Over / Home 初盤" if pin_sub_market == "OU"
-                else "Home 初盤",
-                value=1.95,
-                step=0.01,
-                key="pin_open_a",
-            )
-        with pin_open_cols[1]:
-            pin_open_b = st.number_input(
-                "Under / Away 初盤" if pin_sub_market == "OU"
-                else "Away 初盤",
-                value=1.95,
-                step=0.01,
-                key="pin_open_b",
+        out = []
+
+        for record in records or []:
+            out.append(
+                " ".join(
+                    format_float(record.get(key))
+                    for key in keys
+                )
             )
 
-        st.write("**尾盤**")
-        pin_close_cols = st.columns(2)
-        with pin_close_cols[0]:
-            pin_close_a = st.number_input(
-                "Over / Home 尾盤" if pin_sub_market == "OU"
-                else "Home 尾盤",
-                value=2.05,
-                step=0.01,
-                key="pin_close_a",
-            )
-        with pin_close_cols[1]:
-            pin_close_b = st.number_input(
-                "Under / Away 尾盤" if pin_sub_market == "OU"
-                else "Away 尾盤",
-                value=1.85,
-                step=0.01,
-                key="pin_close_b",
+        return "\n".join(out)
+
+    def _record_has_odds(
+        record: Dict[str, float],
+        market: str,
+    ) -> bool:
+        """A record counts as data only if at least one opening
+        outcome is filled in. Blank template rows are ignored so
+        they never produce an all-zero series."""
+
+        if market in {"OU", "AH"}:
+            return bool(
+                record.get("over")
+                or record.get("under")
             )
 
-        pin_format = st.selectbox(
-            "賠率格式",
-            ["DECIMAL", "HK"],
-            key="pin_format",
-        )
-        pin_enabled = st.checkbox(
-            "啟用 Pinnacle Movement",
-            value=True,
-            key="pin_enabled",
+        return bool(
+            record.get("home")
+            or record.get("draw")
+            or record.get("away")
         )
 
-        # Build odds dicts
-        if pin_sub_market == "OU":
-            pin_odds_open = {"over": pin_open_a, "under": pin_open_b}
-            pin_odds_close = {"over": pin_close_a, "under": pin_close_b}
-            pin_engine_market = "OU"
-        else:
-            pin_odds_open = {"home": pin_open_a, "away": pin_open_b}
-            pin_odds_close = {"home": pin_close_a, "away": pin_close_b}
-            pin_engine_market = "AH"
+    def _period_section(
+        period: str,
+        prefix: str,
+        state_key: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Render one FT or HT sub-form. Returns the list of
+        serialized movement records built from the form contents
+        (without making any Streamlit call, so the caller can
+        decide when to add them to the result list).
+        """
 
-    else:
-        # 1X2 or HHAD: need 3 outcomes
-        pin_sub_market = st.selectbox(
-            "市場",
-            ["1X2", "HHAD"],
-            key="pin_sub_market_3",
-        )
+        records: List[Dict[str, Any]] = []
 
-        st.write("**初盤**")
-        pin_open_cols = st.columns(3)
-        with pin_open_cols[0]:
-            pin_open_h = st.number_input(
-                "Home 初盤",
-                value=2.12,
-                step=0.01,
-                key="pin_open_h",
-            )
-        with pin_open_cols[1]:
-            pin_open_d = st.number_input(
-                "Draw 初盤",
-                value=3.35,
-                step=0.01,
-                key="pin_open_d",
-            )
-        with pin_open_cols[2]:
-            pin_open_a3 = st.number_input(
-                "Away 初盤",
-                value=3.55,
-                step=0.01,
-                key="pin_open_a3",
-            )
+        st.markdown(f"#### 🕒 {period} 時段")
 
-        st.write("**尾盤**")
-        pin_close_cols = st.columns(3)
-        with pin_close_cols[0]:
-            pin_close_h = st.number_input(
-                "Home 尾盤",
-                value=2.05,
-                step=0.01,
-                key="pin_close_h",
-            )
-        with pin_close_cols[1]:
-            pin_close_d = st.number_input(
-                "Draw 尾盤",
-                value=3.40,
-                step=0.01,
-                key="pin_close_d",
-            )
-        with pin_close_cols[2]:
-            pin_close_a3 = st.number_input(
-                "Away 尾盤",
-                value=3.65,
-                step=0.01,
-                key="pin_close_a3",
-            )
-
-        pin_odds_open = {
-            "home": pin_open_h,
-            "draw": pin_open_d,
-            "away": pin_open_a3,
-        }
-        pin_odds_close = {
-            "home": pin_close_h,
-            "draw": pin_close_d,
-            "away": pin_close_a3,
-        }
-        pin_engine_market = pin_sub_market
-        pin_line = None
-        pin_format = st.selectbox(
-            "賠率格式",
-            ["DECIMAL", "HK"],
-            key="pin_format_3",
-        )
-        pin_enabled = st.checkbox(
-            "啟用 Pinnacle Movement",
-            value=True,
-            key="pin_enabled_3",
-        )
-
-    st.divider()
-
-    # ---- Sharp Books Movement ----
-    st.subheader("📊 Sharp Books Movement（共識驗證）")
-    st.caption(
-        "填寫其他莊家的走勢，用來驗證 "
-        "Pinnacle 的動作是真資訊還是單家 noise。"
-    )
-
-    # Determine default market type for new entries
-    if pin_market_type.startswith("2"):
-        default_sb_market = pin_engine_market
-    else:
-        default_sb_market = "OU"
-
-    # Session state for sharp books entries
-    if "sharp_movements_v2" not in st.session_state:
-        st.session_state["sharp_movements_v2"] = [
+        # ---- Pinnacle block for this period ----
+        pin_state = st.session_state[
+            state_key
+        ].setdefault(
+            "pinnacle",
             {
-                "bookmaker": "bet365",
-                "period": "FT",
-                "market": "OU",
-                "line": 2.75,
-                "open_over": 1.90,
-                "open_under": 1.90,
-                "close_over": 2.00,
-                "close_under": 1.80,
-                "odds_format": "DECIMAL",
+                "enabled": True,
+                "markets": {
+                    "OU": [],
+                    "AH": [],
+                    "1X2": [],
+                    "HHAD": [],
+                },
+                "limits": {
+                    "OU": {
+                        "open": "",
+                        "close": "",
+                    },
+                    "AH": {
+                        "open": "",
+                        "close": "",
+                    },
+                    "1X2": {
+                        "open": "",
+                        "close": "",
+                    },
+                    "HHAD": {
+                        "open": "",
+                        "close": "",
+                    },
+                },
             },
-            {
-                "bookmaker": "1xbet",
-                "period": "FT",
-                "market": "OU",
-                "line": 2.75,
-                "open_over": 1.88,
-                "open_under": 1.92,
-                "close_over": 1.98,
-                "close_under": 1.82,
-                "odds_format": "DECIMAL",
-            },
-        ]
-
-    if st.button(
-        "➕ 新增莊家",
-        key="add_book_v2",
-        use_container_width=False,
-    ):
-        st.session_state["sharp_movements_v2"].append(
-            {
-                "bookmaker": "",
-                "period": "FT",
-                "market": default_sb_market,
-                "line": 2.75,
-                "open_over": 1.90,
-                "open_under": 1.90,
-                "close_over": 2.00,
-                "close_under": 1.80,
-                "odds_format": "DECIMAL",
-            }
         )
-        st.rerun()
 
-    # Render editable rows
-    for i, entry in enumerate(
-        st.session_state["sharp_movements_v2"]
-    ):
-        st.write(f"**莊家 #{i+1}**")
+        pin_enabled = st.checkbox(
+            f"啟用 Pinnacle（{period} 基準走勢）",
+            value=pin_state.get("enabled", True),
+            key=f"{prefix}_pin_enabled",
+        )
 
-        row_cols = st.columns([1.5, 0.8, 0.8, 1, 1, 1, 1, 0.8, 0.5])
+        pin_state["enabled"] = pin_enabled
 
-        with row_cols[0]:
-            entry["bookmaker"] = st.text_input(
-                f"名稱##{i}",
-                value=entry["bookmaker"],
-                key=f"sb2_book_{i}",
-                label_visibility="collapsed",
-            )
-        with row_cols[1]:
-            entry["period"] = st.selectbox(
-                f"時段##{i}",
-                ["FT", "HT"],
-                index=0 if entry["period"] == "FT" else 1,
-                key=f"sb2_period_{i}",
-                label_visibility="collapsed",
-            )
-        with row_cols[2]:
-            entry["market"] = st.selectbox(
-                f"市場##{i}",
+        if pin_enabled:
+            chosen_markets = st.multiselect(
+                f"Pinnacle 市場（{period}）",
                 ["OU", "AH", "1X2", "HHAD"],
-                index=(
-                    ["OU", "AH", "1X2", "HHAD"]
-                    .index(entry["market"])
-                ),
-                key=f"sb2_market_{i}",
-                label_visibility="collapsed",
+                default=[
+                    m for m in pin_state["markets"].keys()
+                    if m in {"OU", "AH", "1X2", "HHAD"}
+                ] or ["OU"],
+                key=f"{prefix}_pin_markets",
             )
-        with row_cols[3]:
-            entry["line"] = st.number_input(
-                f"Line##{i}",
-                value=float(entry["line"]),
-                step=0.25,
-                key=f"sb2_line_{i}",
-                label_visibility="collapsed",
-            )
-        with row_cols[4]:
-            entry["open_over"] = st.number_input(
-                f"初盤A##{i}",
-                value=float(entry["open_over"]),
-                step=0.01,
-                key=f"sb2_oo_{i}",
-                label_visibility="collapsed",
-            )
-        with row_cols[5]:
-            entry["open_under"] = st.number_input(
-                f"初盤B##{i}",
-                value=float(entry["open_under"]),
-                step=0.01,
-                key=f"sb2_ou_{i}",
-                label_visibility="collapsed",
-            )
-        with row_cols[6]:
-            entry["close_over"] = st.number_input(
-                f"尾盤A##{i}",
-                value=float(entry["close_over"]),
-                step=0.01,
-                key=f"sb2_co_{i}",
-                label_visibility="collapsed",
-            )
-        with row_cols[7]:
-            entry["odds_format"] = st.selectbox(
-                f"格式##{i}",
-                ["DECIMAL", "HK"],
-                index=0 if entry["odds_format"] == "DECIMAL" else 1,
-                key=f"sb2_fmt_{i}",
-                label_visibility="collapsed",
-            )
-        with row_cols[8]:
-            if st.button(
-                "🗑️",
-                key=f"sb2_del_{i}",
-                help="刪除此行",
-            ):
-                st.session_state["sharp_movements_v2"].pop(i)
-                st.rerun()
 
-        # Show labels for the columns
-        label_cols = st.columns([1.5, 0.8, 0.8, 1, 1, 1, 1, 0.8, 0.5])
-        with label_cols[0]:
-            st.caption("莊家")
-        with label_cols[1]:
-            st.caption("時段")
-        with label_cols[2]:
-            st.caption("市場")
-        with label_cols[3]:
-            st.caption("Line")
-        with label_cols[4]:
-            st.caption(
-                "初盤 Home/Over"
-                if entry["market"] in {"OU", "AH"}
-                else "初盤 Home"
+            for market in chosen_markets:
+                with st.expander(
+                    f"Pinnacle · {market}",
+                    expanded=True,
+                ):
+                    st.caption(
+                        "格式：每行一條線。OU/AH 填 "
+                        "`line over under`；"
+                        "1X2/HHAD 填 `home draw away`。"
+                        "初盤與尾盤分開填，每格一個欄。"
+                    )
+
+                    cols = st.columns(2)
+
+                    with cols[0]:
+                        st.write("**初盤**")
+
+                        open_text = _line_records_to_text(
+                            pin_state["markets"].get(
+                                market, []
+                            ),
+                            market,
+                        )
+
+                        new_open = st.text_area(
+                            "初盤",
+                            value=open_text,
+                            height=100,
+                            key=f"{prefix}_pin_{market}_open",
+                            label_visibility="collapsed",
+                        )
+
+                    with cols[1]:
+                        st.write("**尾盤**")
+
+                        close_text = _line_records_to_text(
+                            pin_state["markets"].get(
+                                market, []
+                            ),
+                            market,
+                        )
+
+                        new_close = st.text_area(
+                            "尾盤",
+                            value=close_text,
+                            height=100,
+                            key=f"{prefix}_pin_{market}_close",
+                            label_visibility="collapsed",
+                        )
+
+                    # Parse both boxes, then pair records by line.
+                    try:
+                        opens = _parse_line_row(
+                            new_open,
+                            market,
+                        )
+
+                        closes = _parse_line_row(
+                            new_close,
+                            market,
+                        )
+
+                    except ValueError as exc:
+                        st.error(str(exc))
+
+                        opens = []
+                        closes = []
+
+                    # Persist so the text boxes keep their content
+                    # across re-renders even when parse fails.
+                    pin_state["markets"][market] = opens
+
+                    pin_state["limits"][market]["open"] = (
+                        new_open
+                    )
+
+                    pin_state["limits"][market]["close"] = (
+                        new_close
+                    )
+
+                    # Pair opening and closing records by line.
+                    # For 3-way markets the line is None, so all
+                    # records pair with each other.
+                    close_map: Dict[Any, Dict[str, float]] = {}
+
+                    for record in closes:
+                        key = (
+                            None
+                            if market in {"1X2", "HHAD"}
+                            else record.get("line")
+                        )
+
+                        close_map[key] = record
+
+                    for open_record in opens:
+                        line_key = (
+                            None
+                            if market in {"1X2", "HHAD"}
+                            else open_record.get("line")
+                        )
+
+                        if not _record_has_odds(
+                            open_record,
+                            market,
+                        ):
+                            continue
+
+                        close_record = close_map.get(
+                            line_key,
+                            open_record,
+                        )
+
+                        if market in {"OU", "AH"}:
+                            odds_open = {
+                                "over": open_record["over"],
+                                "under": open_record["under"],
+                            }
+
+                            odds_close = {
+                                "over": close_record["over"],
+                                "under": close_record["under"],
+                            }
+
+                            line_value = open_record.get(
+                                "line"
+                            )
+
+                        else:
+                            odds_open = {
+                                "home": open_record["home"],
+                                "draw": open_record["draw"],
+                                "away": open_record["away"],
+                            }
+
+                            odds_close = {
+                                "home": close_record["home"],
+                                "draw": close_record["draw"],
+                                "away": close_record["away"],
+                            }
+
+                            line_value = None
+
+                        records.append({
+                            "bookmaker": "pinnacle",
+                            "bookmaker_title": "Pinnacle",
+                            "role": "PRIMARY",
+                            "period": period,
+                            "market": market,
+                            "line": line_value,
+                            "odds_format": "DECIMAL",
+                            "odds_opening": odds_open,
+                            "odds_closing": odds_close,
+                        })
+
+                    # Optional Pinnacle limits
+                    with st.expander(
+                        "Pinnacle 限額（可選）",
+                        expanded=False,
+                    ):
+                        st.caption(
+                            "格式：每行一條 `line limit`。"
+                            "例如 `2.5 1000`。可不填。"
+                        )
+
+                        st.text_area(
+                            "初盤限額",
+                            value=pin_state["limits"][
+                                market
+                            ]["open"],
+                            key=(
+                                f"{prefix}_pin_{market}"
+                                f"_limit_open"
+                            ),
+                            label_visibility="collapsed",
+                        )
+
+                        st.text_area(
+                            "尾盤限額",
+                            value=pin_state["limits"][
+                                market
+                            ]["close"],
+                            key=(
+                                f"{prefix}_pin_{market}"
+                                f"_limit_close"
+                            ),
+                            label_visibility="collapsed",
+                        )
+
+        st.divider()
+
+        # ---- External books for this period ----
+        st.markdown(f"**External Books（{period} 共識驗證）**")
+        st.caption(
+            "每個莊家、每個市場可填多條 line。"
+            "格式同上：初盤尾盤分開填。"
+        )
+
+        book_state = st.session_state[
+            state_key
+        ].setdefault(
+            "external",
+            [
+                {
+                    "_id": "book_1",
+                    "name": "bet365",
+                    "format": "DECIMAL",
+                    "markets": {
+                        "OU": [],
+                        "AH": [],
+                        "1X2": [],
+                        "HHAD": [],
+                    },
+                },
+            ],
+        )
+
+        # Deletions are collected first and applied after the
+        # loop, so removing a row never shifts the indices of the
+        # widgets still being rendered.
+        pending_deletes: List[str] = []
+
+        for entry in book_state:
+            book_id = entry["_id"]
+
+            with st.expander(
+                f"📖 {entry.get('name') or '（未命名）'}",
+                expanded=False,
+            ):
+                head_cols = st.columns([2, 1, 0.5])
+
+                with head_cols[0]:
+                    entry["name"] = st.text_input(
+                        "莊家名稱",
+                        value=entry.get("name", ""),
+                        key=f"{prefix}_ext_{book_id}_name",
+                        label_visibility="collapsed",
+                    )
+
+                with head_cols[1]:
+                    entry["format"] = st.selectbox(
+                        "格式",
+                        ["DECIMAL", "HK"],
+                        index=(
+                            0
+                            if entry.get("format", "DECIMAL")
+                            == "DECIMAL"
+                            else 1
+                        ),
+                        key=(
+                            f"{prefix}_ext_{book_id}_fmt"
+                        ),
+                        label_visibility="collapsed",
+                    )
+
+                with head_cols[2]:
+                    if st.button(
+                        "🗑️",
+                        key=(
+                            f"{prefix}_ext_{book_id}_del"
+                        ),
+                        help="刪除此莊家",
+                    ):
+                        pending_deletes.append(book_id)
+
+                market_choice = st.selectbox(
+                    "市場",
+                    ["OU", "AH", "1X2", "HHAD"],
+                    index=(
+                        ["OU", "AH", "1X2", "HHAD"].index(
+                            list(
+                                entry["markets"].keys()
+                            )[0]
+                            if list(
+                                entry["markets"].keys()
+                            )
+                            else "OU"
+                        )
+                    ),
+                    key=f"{prefix}_ext_{book_id}_market",
+                )
+
+                with st.expander(
+                    f"{entry.get('name') or '莊家'} · "
+                    f"{market_choice} 線位",
+                    expanded=True,
+                ):
+                    oc = st.columns(2)
+
+                    with oc[0]:
+                        st.write("**初盤**")
+
+                        open_text = _line_records_to_text(
+                            entry["markets"].get(
+                                market_choice, []
+                            ),
+                            market_choice,
+                        )
+
+                        st.text_area(
+                            "初盤",
+                            value=open_text,
+                            height=100,
+                            key=(
+                                f"{prefix}_ext_{book_id}"
+                                f"_{market_choice}_open"
+                            ),
+                            label_visibility="collapsed",
+                        )
+
+                    with oc[1]:
+                        st.write("**尾盤**")
+
+                        close_text = _line_records_to_text(
+                            entry["markets"].get(
+                                market_choice, []
+                            ),
+                            market_choice,
+                        )
+
+                        st.text_area(
+                            "尾盤",
+                            value=close_text,
+                            height=100,
+                            key=(
+                                f"{prefix}_ext_{book_id}"
+                                f"_{market_choice}_close"
+                            ),
+                            label_visibility="collapsed",
+                        )
+
+                # Serialize this book's chosen market
+                try:
+                    opens = _parse_line_row(
+                        st.session_state.get(
+                            f"{prefix}_ext_{book_id}"
+                            f"_{market_choice}_open",
+                            "",
+                        ),
+                        market_choice,
+                    )
+
+                    closes = _parse_line_row(
+                        st.session_state.get(
+                            f"{prefix}_ext_{book_id}"
+                            f"_{market_choice}_close",
+                            "",
+                        ),
+                        market_choice,
+                    )
+
+                except ValueError as exc:
+                    st.error(str(exc))
+
+                    opens = []
+                    closes = []
+
+                entry["markets"][market_choice] = opens
+
+                close_map: Dict[Any, Dict[str, float]] = {}
+
+                for record in closes:
+                    key = (
+                        None
+                        if market_choice in {"1X2", "HHAD"}
+                        else record.get("line")
+                    )
+
+                    close_map[key] = record
+
+                for open_record in opens:
+                    line_key = (
+                        None
+                        if market_choice in {"1X2", "HHAD"}
+                        else open_record.get("line")
+                    )
+
+                    if not _record_has_odds(
+                        open_record,
+                        market_choice,
+                    ):
+                        continue
+
+                    close_record = close_map.get(
+                        line_key,
+                        open_record,
+                    )
+
+                    if market_choice in {"OU", "AH"}:
+                        odds_open = {
+                            "over": open_record["over"],
+                            "under": open_record["under"],
+                        }
+
+                        odds_close = {
+                            "over": close_record["over"],
+                            "under": close_record["under"],
+                        }
+
+                        line_value = open_record.get("line")
+
+                    else:
+                        odds_open = {
+                            "home": open_record["home"],
+                            "draw": open_record["draw"],
+                            "away": open_record["away"],
+                        }
+
+                        odds_close = {
+                            "home": close_record["home"],
+                            "draw": close_record["draw"],
+                            "away": close_record["away"],
+                        }
+
+                        line_value = None
+
+                    records.append({
+                        "bookmaker": (
+                            entry["name"]
+                            .lower()
+                            .replace(" ", "_")
+                        ),
+                        "bookmaker_title": entry["name"],
+                        "role": "EXTERNAL",
+                        "period": period,
+                        "market": market_choice,
+                        "line": line_value,
+                        "odds_format": entry.get(
+                            "format",
+                            "DECIMAL",
+                        ),
+                        "odds_opening": odds_open,
+                        "odds_closing": odds_close,
+                    })
+
+        # Apply pending deletions now that every widget has been
+        # rendered for this pass.
+        if pending_deletes:
+            book_state[:] = [
+                e for e in book_state
+                if e["_id"] not in pending_deletes
+            ]
+
+        if st.button(
+            "➕ 新增莊家",
+            key=f"{prefix}_add_book",
+        ):
+            used = {
+                e["_id"]
+                for e in book_state
+            }
+
+            counter = len(book_state) + 1
+
+            while f"book_{counter}" in used:
+                counter += 1
+
+            book_state.append({
+                "_id": f"book_{counter}",
+                "name": "",
+                "format": "DECIMAL",
+                "markets": {
+                    "OU": [],
+                    "AH": [],
+                    "1X2": [],
+                    "HHAD": [],
+                },
+            })
+
+        return records
+
+    # ============================================================
+    # Period selection: FT / HT are separate blocks, not an either-
+    # or dropdown. Each block is fully self-contained.
+    # ============================================================
+
+    period_state = st.session_state.setdefault(
+        "mv_period_state",
+        {
+            "periods": ["FT"],
+        },
+    )
+
+    chosen_periods = st.multiselect(
+        "啟用時段",
+        ["FT", "HT"],
+        default=period_state.get("periods", ["FT"]),
+        key="mv_periods",
+    )
+
+    period_state["periods"] = chosen_periods or ["FT"]
+
+    # One persistent namespace per period so switching the
+    # selector does not wipe data already entered.
+    mv_state = st.session_state.setdefault(
+        "mv_form_state",
+        {},
+    )
+
+    all_records: List[Dict[str, Any]] = []
+
+    for period in period_state["periods"]:
+        prefix = f"mv_{period}"
+
+        mv_state.setdefault(
+            period,
+            {
+                "pinnacle": {
+                    "enabled": True,
+                    "markets": {
+                        "OU": [],
+                        "AH": [],
+                        "1X2": [],
+                        "HHAD": [],
+                    },
+                    "limits": {
+                        "OU": {"open": "", "close": ""},
+                        "AH": {"open": "", "close": ""},
+                        "1X2": {"open": "", "close": ""},
+                        "HHAD": {"open": "", "close": ""},
+                    },
+                },
+                "external": [
+                    {
+                        "_id": f"{period}_book_1",
+                        "name": "bet365",
+                        "format": "DECIMAL",
+                        "markets": {
+                            "OU": [],
+                            "AH": [],
+                            "1X2": [],
+                            "HHAD": [],
+                        },
+                    },
+                ],
+            },
+        )
+
+        all_records.extend(
+            _period_section(
+                period,
+                prefix,
+                period,
             )
-        with label_cols[5]:
-            st.caption(
-                "初盤 Away/Under"
-                if entry["market"] in {"OU", "AH"}
-                else "初盤 Draw"
-            )
-        with label_cols[6]:
-            st.caption(
-                "尾盤 Home/Over"
-                if entry["market"] in {"OU", "AH"}
-                else "尾盤 Away"
-            )
-        with label_cols[7]:
-            st.caption("格式")
-        with label_cols[8]:
-            st.caption("")
+        )
 
     st.divider()
 
-    # ---- Generate JSON button ----
+    # ---- Generate / preview ----
     col_gen, col_preview = st.columns([1, 1])
 
     with col_gen:
@@ -2711,69 +3117,48 @@ with movement_help_tab:
 
     if generate_clicked or preview_clicked:
         movements = []
+        seen_ids: set = set()
+        counter = 0
 
-        # Build Pinnacle series
-        if pin_enabled:
-            pin_series = _build_movement_series(
-                bookmaker="pinnacle",
-                bookmaker_title="Pinnacle",
-                role="PRIMARY",
-                period="FT",
-                market=pin_engine_market,
-                line=pin_line,
-                odds_opening=pin_odds_open,
-                odds_closing=pin_odds_close,
-                odds_format=pin_format,
-                series_id="PIN_001",
-            )
-            if pin_series:
-                movements.append(pin_series)
-
-        # Build sharp books series
-        for i, entry in enumerate(
-            st.session_state["sharp_movements_v2"]
-        ):
-            if not entry["bookmaker"]:
+        for record in all_records:
+            if not record.get("bookmaker_title"):
                 continue
 
-            if entry["market"] in {"OU", "AH"}:
-                odds_open = {
-                    "over": entry["open_over"],
-                    "under": entry["open_under"],
-                }
-                odds_close = {
-                    "over": entry["close_over"],
-                    "under": entry["close_under"],
-                }
-                line_val = entry["line"]
-            else:
-                # 1X2 / HHAD: for simplicity, store home/draw/away
-                # User enters home in open_over, draw in open_under,
-                # away in close_over (reusing fields)
-                odds_open = {
-                    "home": entry["open_over"],
-                    "draw": entry["open_under"],
-                    "away": entry["close_over"],
-                }
-                odds_close = {
-                    "home": entry["open_over"],
-                    "draw": entry["open_under"],
-                    "away": entry["close_over"],
-                }
-                line_val = None
+            counter += 1
+
+            role_prefix = {
+                "PRIMARY": "PIN",
+                "EXTERNAL": "EXT",
+                "HKJC": "HKJC",
+            }.get(
+                record.get("role", "EXTERNAL"),
+                "SRC",
+            )
+
+            series_id = f"{role_prefix}_{counter:03d}"
+
+            while series_id in seen_ids:
+                counter += 1
+                series_id = f"{role_prefix}_{counter:03d}"
+
+            seen_ids.add(series_id)
 
             series = _build_movement_series(
-                bookmaker=entry["bookmaker"].lower().replace(" ", "_"),
-                bookmaker_title=entry["bookmaker"],
-                role="EXTERNAL",
-                period=entry["period"],
-                market=entry["market"],
-                line=line_val,
-                odds_opening=odds_open,
-                odds_closing=odds_close,
-                odds_format=entry["odds_format"],
-                series_id=f"EXT_{i+1:03d}",
+                bookmaker=record["bookmaker"],
+                bookmaker_title=record["bookmaker_title"],
+                role=record.get("role", "EXTERNAL"),
+                period=record["period"],
+                market=record["market"],
+                line=record.get("line"),
+                odds_opening=record["odds_opening"],
+                odds_closing=record["odds_closing"],
+                odds_format=record.get(
+                    "odds_format",
+                    "DECIMAL",
+                ),
+                series_id=series_id,
             )
+
             if series:
                 movements.append(series)
 
@@ -2799,7 +3184,7 @@ with movement_help_tab:
                     language="json",
                 )
 
-    # ---- HKJC Movement (optional) ----
+    # ---- HKJC Movement (optional, kept self-contained) ----
     with st.expander(
         "🏟️ HKJC Movement（可選）",
         expanded=False,
@@ -2807,6 +3192,13 @@ with movement_help_tab:
         st.caption(
             "HKJC 走勢用來判斷滯後/跟隨/衝突。"
             "格式為 HK odds（+1）。"
+            "初盤尾盤分開填。"
+        )
+
+        hk_period = st.selectbox(
+            "HKJC 時段",
+            ["FT", "HT"],
+            key="hk_period_sel",
         )
 
         hk_market_type = st.selectbox(
@@ -2821,52 +3213,57 @@ with movement_help_tab:
                 ["OU", "AH"],
                 key="hk_sub_market",
             )
-            hk_line_val = st.number_input(
-                "Line",
-                value=2.75,
-                step=0.25,
-                key="hk_line_val_input",
-            )
+
             hk_col = st.columns(2)
             with hk_col[0]:
-                hk_open_a = st.number_input(
+                hk_open_a = st.text_input(
                     "初盤 Over/Home (HK)",
-                    value=0.75,
-                    step=0.01,
+                    value="0.75 0.95",
                     key="hk_open_a_input",
                 )
             with hk_col[1]:
-                hk_open_b = st.number_input(
-                    "初盤 Under/Away (HK)",
-                    value=0.95,
-                    step=0.01,
-                    key="hk_open_b_input",
-                )
-            hk_col2 = st.columns(2)
-            with hk_col2[0]:
-                hk_close_a = st.number_input(
+                hk_close_a = st.text_input(
                     "尾盤 Over/Home (HK)",
-                    value=0.88,
-                    step=0.01,
+                    value="0.88 0.82",
                     key="hk_close_a_input",
                 )
-            with hk_col2[1]:
-                hk_close_b = st.number_input(
-                    "尾盤 Under/Away (HK)",
-                    value=0.82,
-                    step=0.01,
-                    key="hk_close_b_input",
+
+            try:
+                hk_tokens_open = hk_open_a.split()
+                hk_tokens_close = hk_close_a.split()
+
+                if hk_sub == "OU":
+                    hk_odds_open = {
+                        "over": float(hk_tokens_open[0]),
+                        "under": float(hk_tokens_open[1]),
+                    }
+                    hk_odds_close = {
+                        "over": float(hk_tokens_close[0]),
+                        "under": float(hk_tokens_close[1]),
+                    }
+                else:
+                    hk_odds_open = {
+                        "home": float(hk_tokens_open[0]),
+                        "away": float(hk_tokens_open[1]),
+                    }
+                    hk_odds_close = {
+                        "home": float(hk_tokens_close[0]),
+                        "away": float(hk_tokens_close[1]),
+                    }
+
+                hk_line_final = None
+                hk_engine_market = hk_sub
+
+            except (ValueError, IndexError):
+                st.error(
+                    "HKJC 初盤/尾盤需要兩個數值，"
+                    "用空格分隔，例如 `0.75 0.95`。"
                 )
 
-            if hk_sub == "OU":
-                hk_odds_open = {"over": hk_open_a, "under": hk_open_b}
-                hk_odds_close = {"over": hk_close_a, "under": hk_close_b}
-            else:
-                hk_odds_open = {"home": hk_open_a, "away": hk_open_b}
-                hk_odds_close = {"home": hk_close_a, "away": hk_close_b}
-
-            hk_engine_market = hk_sub
-            hk_line_final = hk_line_val
+                hk_odds_open = {"over": 1.0, "under": 1.0}
+                hk_odds_close = {"over": 1.0, "under": 1.0}
+                hk_engine_market = hk_sub
+                hk_line_final = None
 
         else:
             hk_sub = st.selectbox(
@@ -2874,33 +3271,58 @@ with movement_help_tab:
                 ["1X2", "HHAD"],
                 key="hk_sub_market_3",
             )
-            hk_col = st.columns(3)
-            with hk_col[0]:
-                hk_h = st.number_input(
-                    "Home (HK)",
-                    value=0.75,
-                    step=0.01,
-                    key="hk_h_3",
-                )
-            with hk_col[1]:
-                hk_d = st.number_input(
-                    "Draw (HK)",
-                    value=1.20,
-                    step=0.01,
-                    key="hk_d_3",
-                )
-            with hk_col[2]:
-                hk_a = st.number_input(
-                    "Away (HK)",
-                    value=1.55,
-                    step=0.01,
-                    key="hk_a_3",
+
+            hk_open_text = st.text_input(
+                "初盤 Home Draw Away (HK)",
+                value="0.75 1.20 1.55",
+                key="hk_open_text_3",
+            )
+
+            hk_close_text = st.text_input(
+                "尾盤 Home Draw Away (HK)",
+                value="0.80 1.15 1.50",
+                key="hk_close_text_3",
+            )
+
+            try:
+                o = hk_open_text.split()
+                c = hk_close_text.split()
+
+                hk_odds_open = {
+                    "home": float(o[0]),
+                    "draw": float(o[1]),
+                    "away": float(o[2]),
+                }
+
+                hk_odds_close = {
+                    "home": float(c[0]),
+                    "draw": float(c[1]),
+                    "away": float(c[2]),
+                }
+
+                hk_engine_market = hk_sub
+                hk_line_final = None
+
+            except (ValueError, IndexError):
+                st.error(
+                    "HKJC 初盤/尾盤需要三個數值，"
+                    "用空格分隔。"
                 )
 
-            hk_odds_open = {"home": hk_h, "draw": hk_d, "away": hk_a}
-            hk_odds_close = {"home": hk_h, "draw": hk_d, "away": hk_a}
-            hk_engine_market = hk_sub
-            hk_line_final = None
+                hk_odds_open = {
+                    "home": 1.0,
+                    "draw": 1.0,
+                    "away": 1.0,
+                }
+
+                hk_odds_close = {
+                    "home": 1.0,
+                    "draw": 1.0,
+                    "away": 1.0,
+                }
+
+                hk_engine_market = hk_sub
+                hk_line_final = None
 
         if st.button(
             "➕ 加入 HKJC Movement",
@@ -2910,7 +3332,7 @@ with movement_help_tab:
                 bookmaker="hkjc",
                 bookmaker_title="HKJC",
                 role="HKJC",
-                period="FT",
+                period=hk_period,
                 market=hk_engine_market,
                 line=hk_line_final,
                 odds_opening=hk_odds_open,
@@ -2918,12 +3340,23 @@ with movement_help_tab:
                 odds_format="HK",
                 series_id="HKJC_001",
             )
+
             if hk_series:
                 if "generated_movements" not in st.session_state:
                     st.session_state["generated_movements"] = []
-                st.session_state["generated_movements"].append(
-                    hk_series
-                )
+
+                # Avoid stacking duplicates if the user clicks
+                # repeatedly.
+                for existing in st.session_state[
+                    "generated_movements"
+                ]:
+                    if existing.get("id") == "HKJC_001":
+                        break
+                else:
+                    st.session_state[
+                        "generated_movements"
+                    ].append(hk_series)
+
                 st.success("✅ HKJC series 已加入")
 
     st.divider()
@@ -2940,25 +3373,41 @@ with movement_help_tab:
             type="primary",
             use_container_width=True,
         ):
+            # Use a callback-style write through a sentinel so we
+            # never assign to the text_area's own key directly
+            # (that raises StreamlitWidgetAlreadyInstantiatedError).
             try:
                 current_json = json.loads(
                     st.session_state.get(
                         "json_input", "{}"
                     )
+                    or "{}"
                 )
-                current_json["odds_movements"] = (
-                    st.session_state["generated_movements"]
-                )
-                st.session_state["json_input"] = json_text(
-                    current_json
-                )
-                st.success(
-                    "✅ odds_movements 已注入到 JSON 輸入欄位"
-                )
+
             except json.JSONDecodeError:
+                current_json = None
+
+            if current_json is None:
+                st.session_state[
+                    "json_input"
+                ] = "INVALID"
+
                 st.error(
                     "當前 JSON 輸入無效，無法注入。"
                     "請先修復 JSON 格式。"
+                )
+
+            else:
+                current_json["odds_movements"] = (
+                    st.session_state["generated_movements"]
+                )
+
+                st.session_state[
+                    "mv_inject_pending"
+                ] = json_text(current_json)
+
+                st.success(
+                    "✅ odds_movements 已注入到 JSON 輸入欄位"
                 )
 
 
