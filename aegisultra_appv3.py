@@ -1631,7 +1631,15 @@ def _build_movement_series(
 
     import datetime as _dt
 
-    now = _dt.datetime.now().astimezone().isoformat(timespec="minutes")
+    # Fixed opening / closing timestamps. The user enters both
+    # snapshots by hand at the same time, so we cannot use the
+    # real clock: identical timestamps would make every movement
+    # delta zero and the whole analysis collapse. Using two fixed
+    # points 2 hours apart keeps the directionality intact while
+    # staying reproducible, and the exact wall-clock moment has
+    # no analytical value here.
+    OPEN_TS = "2026-10-13T12:00:00Z"
+    CLOSE_TS = "2026-10-13T14:00:00Z"
 
     return {
         "id": series_id,
@@ -1649,11 +1657,11 @@ def _build_movement_series(
         "odds_format": odds_format,
         "observations": [
             {
-                "timestamp": now,
+                "timestamp": OPEN_TS,
                 "odds": dict(odds_opening),
             },
             {
-                "timestamp": now,
+                "timestamp": CLOSE_TS,
                 "odds": dict(odds_closing),
             },
         ],
