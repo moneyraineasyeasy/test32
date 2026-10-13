@@ -2254,6 +2254,112 @@ def _ensure_movement_session() -> None:
     st.session_state["sharp_movements_v2"] = flat
 
 
+def _parse_odds_line(
+    market: str,
+    text: str,
+) -> tuple[Optional[Dict[str, Any]], str]:
+    """
+    One row of the text table -> one line record.
+
+      OU / AH  ->  "line over under"   e.g. "2.5 1.9 1.9"
+      1X2/HHAD ->  "home draw away"    e.g. "2.1 3.4 3.2"
+
+    Returns (record or None, error message).
+    """
+
+    if market in {"1X2", "HHAD"}:
+        required = 3
+        labels = ["home", "draw", "away"]
+    else:
+        required = 3
+        labels = ["line", "over", "under"]
+
+    parts = text.split()
+    if len(parts) != required:
+        return (
+            None,
+            f"需要 {required} 個數值（{', '.join(labels)}），"
+            f"收到 {len(parts)} 個",
+        )
+
+    nums: list[float] = []
+    for i, part in enumerate(parts):
+        try:
+            nums.append(float(part))
+        except ValueError:
+            return (
+                None,
+                f"第 {i + 1} 個「{part}」不是有效數字",
+            )
+
+    if market in {"1X2", "HHAD"}:
+        return {
+            "line": None,
+            "open_home": nums[0],
+            "close_home": nums[0],
+            "open_draw": nums[1],
+            "close_draw": nums[1],
+            "open_away": nums[2],
+            "close_away": nums[2],
+        }, ""
+
+    return {
+        "line": nums[0],
+        "open_over": nums[1],
+        "close_over": nums[1],
+        "open_under": nums[2],
+        "close_under": nums[2],
+    }, ""
+
+
+def _line_to_text(
+    market: str,
+    record: Dict[str, Any],
+) -> str:
+    """Serialize one record back to the text-table format."""
+
+    if not isinstance(record, dict):
+        return ""
+
+    def g(field: str) -> str:
+        v = safe_float(record.get(field))
+        return f"{v:.2f}" if v is not None else ""
+
+    if market in {"1X2", "HHAD"}:
+        return "  ".join([
+            g("open_home"),
+            g("open_draw"),
+            g("open_away"),
+        ]).strip()
+
+    return "  ".join([
+        f'{safe_float(record.get("line"), 0.0):.2f}',
+        g("open_over"),
+        g("open_under"),
+    ]).strip()
+
+
+def _next_entry_id() -> int:
+    """Return a monotonically increasing id stored on the session."""
+
+    ss = st.session_state
+    ss.setdefault("_mv_entry_seq", 0)
+    ss["_mv_entry_seq"] += 1
+
+    return ss["_mv_entry_seq"]
+
+
+def _pending_deletes(
+    period: str,
+) -> list:
+    """Ids queued for deletion in this period; flushed after render."""
+
+    key = f"_mv_pending_del_{period}"
+    st.session_state.setdefault(key, [])
+
+    return st.session_state[key]
+
+
 def _market_block_editor(
     *,
     period: str,
@@ -2263,157 +2369,68 @@ def _market_block_editor(
     key_prefix: str,
     show_bookmaker: bool = False,
     bookmaker: str = "",
-) -> tuple[list, str, str]:
+) -> tuple[list, str, str, bool]:
     """
-    Edit the line list for one market. Returns the (possibly
-    mutated) records, the odds format and the bookmaker title.
+    A text-input table: one line per row.
+      OU / AH  ->  "line over under"   e.g. "2.5 1.9 1.9"
+      1X2/HHAD ->  "home draw away"    e.g. "2.1 3.4 3.2"
     """
 
-    open_fields, close_fields, labels = _outcome_fields_for(
-        market
+    if market in {"1X2", "HHAD"}:
+        header = "格式：home  draw  away"
+        placeholder = "2.10  3.40  3.20"
+    else:
+        header = "格式：line  over  under"
+        placeholder = "2.50  1.90  1.90"
+
+    st.caption(header)
+
+    examples = "\n".join(
+        _line_to_text(market, r) for r in line_records
     )
 
-    edited: list = []
-    current_format = odds_format
-    current_bookmaker = bookmaker
-
-    if show_bookmaker:
-        current_bookmaker = st.text_input(
-            "莊家名稱",
-            value=bookmaker or "",
-            key=f"{key_prefix}_bk",
-            placeholder="例：bet365",
-        )
-
-    current_format = st.selectbox(
-        "賠率格式",
-        ["DECIMAL", "HK"],
-        index=0 if odds_format == "DECIMAL" else 1,
-        key=f"{key_prefix}_fmt",
+    raw = st.text_area(
+        label="lines（每行一條）",
+        value=examples,
+        height=max(80, 32 * max(2, len(line_records) + 1)),
+        key=f"{key_prefix}_txt",
+        placeholder=placeholder,
+        label_visibility="collapsed",
     )
 
-    for idx, record in enumerate(line_records):
-        st.markdown(
-            f"**Line {idx + 1}**"
-        )
-
-        line_val = record.get("line")
-
-        if market in {"1X2", "HHAD"}:
-            rendered_line = "—（讓球盤不適用）"
-        else:
-            rendered_line = safe_float(
-                line_val, 0.0
-            )
-
-        col_line, col_open, col_close = st.columns(
-            [1, 1.6, 1.6]
-        )
-
-        with col_line:
-            if market in {"1X2", "HHAD"}:
-                st.text_input(
-                    "Line",
-                    value="—",
-                    key=f"{key_prefix}_ln_{idx}",
-                    disabled=True,
-                    label_visibility="visible",
-                )
-
-                record["line"] = None
-            else:
-                record["line"] = st.number_input(
-                    "Line",
-                    value=float(
-                        safe_float(line_val, 0.0) or 0.0
-                    ),
-                    step=0.25,
-                    key=f"{key_prefix}_ln_{idx}",
-                    label_visibility="visible",
-                )
-
-        with col_open:
-            st.caption("初盤")
-
-            for field, label in zip(
-                open_fields, labels
-            ):
-                record[field] = st.number_input(
-                    f"{label} 初盤",
-                    value=float(
-                        safe_float(
-                            record.get(field), 1.90
-                        ) or 1.90
-                    ),
-                    step=0.01,
-                    key=f"{key_prefix}_op_{idx}_{field}",
-                    label_visibility="visible",
-                )
-
-        with col_close:
-            st.caption("尾盤")
-
-            for field, label in zip(
-                close_fields, labels
-            ):
-                record[field] = st.number_input(
-                    f"{label} 尾盤",
-                    value=float(
-                        safe_float(
-                            record.get(field), 1.90
-                        ) or 1.90
-                    ),
-                    step=0.01,
-                    key=f"{key_prefix}_cl_{idx}_{field}",
-                    label_visibility="visible",
-                )
-
-        edited.append(record)
-
-        if st.button(
-            "🗑️ 刪除這條線",
-            key=f"{key_prefix}_del_{idx}",
-        ):
-            return (
-                [
-                    r for r in line_records
-                    if r is not record
-                ],
-                current_format,
-                current_bookmaker,
-                True,  # signal rerun
-            )
-
-    if st.button(
-        "➕ 新增一條線",
-        key=f"{key_prefix}_add",
-        use_container_width=False,
+    parsed: list = []
+    for lineno, line in enumerate(
+        raw.splitlines(), start=1
     ):
-        last_line = safe_float(
-            (edited[-1].get("line") if edited else None),
-            2.50,
+        text = line.strip()
+
+        if not text:
+            continue
+
+        record, err = _parse_odds_line(
+            market, text
         )
 
-        edited.append(
+        if err:
+            st.error(
+                f"第 {lineno} 行：「{text}」— {err}"
+            )
+            continue
+
+        parsed.append(record)
+
+    if not parsed:
+        # 使用者清空內容時保留一筆樣板，介面才不會消失。
+        parsed = [
             _default_line_record(
                 market,
-                last_line,
+                2.50 if market not in {
+                    "1X2", "HHAD"
+                } else 0.0,
             )
-        )
+        ]
 
-        return (
-            edited,
-            current_format,
-            current_bookmaker,
-            True,
-        )
-
-    return (
-        edited,
-        current_format,
-        current_bookmaker,
-        False,
-    )
+    return parsed, odds_format, bookmaker, False
 
 
 def _period_section(
@@ -2483,9 +2500,6 @@ def _period_section(
 
             pin["odds_format"] = fmt
             pin_block[market] = updated
-
-            if needs_rerun:
-                st.rerun()
 
             # Pinnacle limits (optional)
             with st.expander(
@@ -2559,20 +2573,32 @@ def _period_section(
         "mv_external"
     ].setdefault(period, [])
 
-    for idx, entry in enumerate(entries):
-        st.markdown(
-            f"**莊家 #{idx + 1}**"
-        )
+    # 每個 entry 配上穩定 id；以 id 作為 widget key，
+    # 增刪後不會讓後面的 entry 拿到錯的 key。
+    for entry in entries:
+        if "_id" not in entry:
+            entry["_id"] = _next_entry_id()
 
+    cols_header = st.columns([2, 1.2, 1, 0.6])
+
+    with cols_header[0]:
+        st.caption("莊家")
+
+    with cols_header[1]:
+        st.caption("市場")
+
+    with cols_header[2]:
+        st.caption("格式")
+
+    for idx, entry in enumerate(entries):
+        eid = entry["_id"]
         cols = st.columns([2, 1.2, 1, 0.6])
 
         with cols[0]:
             entry["bookmaker"] = st.text_input(
                 "名稱",
                 value=entry.get("bookmaker", ""),
-                key=(
-                    f"ext_{period}_{idx}_bk"
-                ),
+                key=f"ext_{period}_{eid}_bk",
                 label_visibility="collapsed",
             )
 
@@ -2589,7 +2615,7 @@ def _period_section(
                 index=["OU", "AH", "1X2", "HHAD"].index(
                     _ext_market
                 ),
-                key=f"ext_{period}_{idx}_mk",
+                key=f"ext_{period}_{eid}_mk",
                 label_visibility="collapsed",
             )
 
@@ -2600,65 +2626,45 @@ def _period_section(
                 index=0 if entry.get(
                     "odds_format", "DECIMAL"
                 ) == "DECIMAL" else 1,
-                key=f"ext_{period}_{idx}_fmt",
+                key=f"ext_{period}_{eid}_fmt",
                 label_visibility="collapsed",
             )
 
         with cols[3]:
             if st.button(
                 "🗑️",
-                key=f"ext_{period}_{idx}_del",
+                key=f"ext_{period}_{eid}_del",
                 help="刪除這個莊家",
             ):
-                entries.pop(idx)
+                _pending_deletes(period).append(eid)
 
-                # Sync legacy slot before rerun.
-                flat = [
-                    dict(e) for e in entries
-                    if isinstance(e, dict)
-                ]
-
-                st.session_state[
-                    "sharp_movements_v2"
-                ] = flat
-
-                st.rerun()
-
-        lines = entry.setdefault("lines", [])
-
-        (
-            updated,
-            fmt,
-            bk,
-            needs_rerun,
-        ) = _market_block_editor(
+        entry["lines"] = _market_block_editor(
             period=period,
             market=entry["market"],
-            line_records=lines,
+            line_records=entry.get("lines", []),
             odds_format=entry.get(
                 "odds_format", "DECIMAL"
             ),
-            key_prefix=(
-                f"ext_{period}_{idx}"
-            ),
+            key_prefix=f"ext_{period}_{eid}",
             show_bookmaker=False,
-        )
+        )[0]
 
-        entry["lines"] = updated
-        entry["odds_format"] = fmt
-
-        if bk:
-            entry["bookmaker"] = bk
-
-        if needs_rerun:
-            st.rerun()
+        entry["period"] = period
 
     if st.button(
         "➕ 新增莊家",
         key=f"add_book_{period}",
         use_container_width=False,
     ):
+        # 先處理刪除（依 id），再處理新增；全部 render 完才決定 rerun。
+        for eid in _pending_deletes(period):
+            for j, entry in enumerate(entries):
+                if entry.get("_id") == eid:
+                    entries.pop(j)
+                    break
+
         entries.append({
+            "_id": _next_entry_id(),
             "bookmaker": "",
             "period": period,
             "market": "OU",
@@ -2668,7 +2674,28 @@ def _period_section(
             ],
         })
 
-        st.rerun()
+
+def _record_has_odds(
+    market: str,
+    record: Dict[str, Any],
+) -> bool:
+    """A record is usable only when it has real odds."""
+
+    if not isinstance(record, dict):
+        return False
+
+    if market in {"1X2", "HHAD"}:
+        fields = ["open_home", "open_draw", "open_away"]
+    elif market == "AH":
+        fields = ["open_home", "open_away"]
+    else:
+        fields = ["open_over", "open_under"]
+
+    for f in fields:
+        if safe_float(record.get(f)) in (None, 0.0):
+            return False
+
+    return True
 
 
 def _build_series_from_record(
@@ -2767,6 +2794,13 @@ def _build_all_series() -> list:
                 continue
 
             for i, record in enumerate(lines):
+                # 文字表解析失敗時會留下空白樣板，
+                # 沒有有效賠率，直接跳過。
+                if not _record_has_odds(
+                    market, record
+                ):
+                    continue
+
                 series = _build_series_from_record(
                     bookmaker="pinnacle",
                     bookmaker_title="Pinnacle",
@@ -2804,9 +2838,12 @@ def _build_all_series() -> list:
             market = entry.get("market", "OU")
             fmt = entry.get("odds_format", "DECIMAL")
 
-            for i, record in enumerate(
-                entry.get("lines", [])
-            ):
+            valid_lines = [
+                r for r in entry.get("lines", [])
+                if _record_has_odds(market, r)
+            ]
+
+            for i, record in enumerate(valid_lines):
                 series = _build_series_from_record(
                     bookmaker=bookmaker.lower().replace(
                         " ", "_"
