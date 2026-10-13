@@ -2456,7 +2456,7 @@ with movement_help_tab:
         for record in records or []:
             out.append(
                 " ".join(
-                    format_float(record.get(key))
+                    format_odds(record.get(key), digits=3)
                     for key in keys
                 )
             )
@@ -2500,8 +2500,25 @@ with movement_help_tab:
         st.markdown(f"#### 🕒 {period} 時段")
 
         # ---- Pinnacle block for this period ----
-        pin_state = st.session_state[
-            state_key
+        # Read the persisted form state defensively: an old session
+        # may not have the expected nested shape, and a bare
+        # subscript would raise KeyError and blank the whole page.
+        if state_key not in st.session_state or not isinstance(
+            st.session_state.get(state_key),
+            dict,
+        ):
+            st.session_state[state_key] = {}
+
+        period_state_root = st.session_state[state_key]
+
+        if period not in period_state_root or not isinstance(
+            period_state_root.get(period),
+            dict,
+        ):
+            period_state_root[period] = {}
+
+        pin_state = period_state_root[
+            period
         ].setdefault(
             "pinnacle",
             {
@@ -2749,8 +2766,8 @@ with movement_help_tab:
             "格式同上：初盤尾盤分開填。"
         )
 
-        book_state = st.session_state[
-            state_key
+        book_state = period_state_root[
+            period
         ].setdefault(
             "external",
             [
@@ -3093,7 +3110,7 @@ with movement_help_tab:
             _period_section(
                 period,
                 prefix,
-                period,
+                "mv_form_state",
             )
         )
 
