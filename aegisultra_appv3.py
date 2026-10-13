@@ -2441,9 +2441,10 @@ def _period_section(
         chosen = st.multiselect(
             f"Pinnacle 市場（{period}）",
             ["OU", "AH", "1X2", "HHAD"],
-            default=list(
-                pin_block.keys()
-            ) or ["OU"],
+            default=[
+                m for m in pin_block.keys()
+                if m in {"OU", "AH", "1X2", "HHAD"}
+            ] or ["OU"],
             key=f"mv_pin_markets_{period}",
         )
 
@@ -2576,11 +2577,17 @@ def _period_section(
             )
 
         with cols[1]:
+            _ext_market = entry.get("market", "OU")
+            if _ext_market not in {
+                "OU", "AH", "1X2", "HHAD"
+            }:
+                _ext_market = "OU"
+
             entry["market"] = st.selectbox(
                 "市場",
                 ["OU", "AH", "1X2", "HHAD"],
                 index=["OU", "AH", "1X2", "HHAD"].index(
-                    entry.get("market", "OU")
+                    _ext_market
                 ),
                 key=f"ext_{period}_{idx}_mk",
                 label_visibility="collapsed",
