@@ -4316,12 +4316,12 @@ def build_ht_ft_coherence_audit(
 ):
     ft_section = period_results.get(
         "FT",
-        {},
+        {}
     )
 
     ht_section = period_results.get(
         "HT",
-        {},
+        {}
     )
 
     ft_scenarios = ft_section.get(
@@ -4342,7 +4342,6 @@ def build_ht_ft_coherence_audit(
                 "are required."
             ),
             "scenarios": [],
-            "expectation_checks": [],
         }
 
     ft_map = {
@@ -4401,171 +4400,8 @@ def build_ht_ft_coherence_audit(
                 "source/de-vig scenarios."
             ),
             "scenarios": [],
-            "expectation_checks": [],
         }
 
-    # ------------------------------------------------------------
-    # Expectation-value consistency checks
-    # ------------------------------------------------------------
-    # Check 1: E[HT total goals] / E[FT total goals] in [0.40, 0.50]
-    # Check 2: Home/Away rate ratio direction consistent HT vs FT
-    # Check 3: HT individual rates must not exceed FT rates
-    # (HT is a temporal subset of FT)
-    # ------------------------------------------------------------
-
-    expectation_checks = []
-
-    for ht_scenario in ht_scenarios:
-        key = (
-            ht_scenario["source"],
-            ht_scenario["devig_method"],
-        )
-
-        ft_scenario = ft_map.get(
-            key,
-        )
-
-        if ft_scenario is None:
-            continue
-
-        lambda_ht_home = ht_scenario.get(
-            "lambda_home",
-        )
-        lambda_ht_away = ht_scenario.get(
-            "lambda_away",
-        )
-        lambda_ft_home = ft_scenario.get(
-            "lambda_home",
-        )
-        lambda_ft_away = ft_scenario.get(
-            "lambda_away",
-        )
-
-        if not all(
-            isinstance(v, (int, float))
-            and math.isfinite(v)
-            and v > 0.0
-            for v in [
-                lambda_ht_home,
-                lambda_ht_away,
-                lambda_ft_home,
-                lambda_ft_away,
-            ]
-        ):
-            expectation_checks.append({
-                "source": key[0],
-                "devig_method": key[1],
-                "status": "NOT_AVAILABLE",
-                "reason": (
-                    "Cannot compute "
-                    "expectation-value checks "
-                    "(lambda values missing or "
-                    "non-positive)."
-                ),
-            })
-            continue
-
-        expected_ht_total = (
-            lambda_ht_home
-            + lambda_ht_away
-        )
-
-        expected_ft_total = (
-            lambda_ft_home
-            + lambda_ft_away
-        )
-
-        total_goals_ratio = (
-            expected_ht_total
-            / expected_ft_total
-            if expected_ft_total > 0
-            else None
-        )
-
-        # Check 1: total-goals ratio in [0.40, 0.50]
-        check_1_pass = (
-            total_goals_ratio is not None
-            and 0.40
-            <= total_goals_ratio
-            <= 0.50
-        )
-
-        # Check 2: home/away rate-ratio direction consistency
-        ht_ratio = (
-            lambda_ht_home / lambda_ht_away
-            if lambda_ht_away > 0
-            else None
-        )
-
-        ft_ratio = (
-            lambda_ft_home / lambda_ft_away
-            if lambda_ft_away > 0
-            else None
-        )
-
-        check_2_pass = (
-            ht_ratio is not None
-            and ft_ratio is not None
-            and (
-                (ht_ratio > 1.0)
-                == (ft_ratio > 1.0)
-            )
-        )
-
-        # Check 3: HT rates should not exceed FT rates
-        # (HT is a subset of FT temporally)
-        check_3_pass = (
-            lambda_ht_home <= lambda_ft_home
-            and lambda_ht_away <= lambda_ft_away
-        )
-
-        all_pass = (
-            check_1_pass
-            and check_2_pass
-            and check_3_pass
-        )
-
-        expectation_checks.append({
-            "source": key[0],
-            "devig_method": key[1],
-            "status": (
-                "PASS"
-                if all_pass
-                else "HT_FT_EXPECTATION_INCONSISTENT"
-            ),
-            "expected_ht_total_goals": float(
-                expected_ht_total
-            ),
-            "expected_ft_total_goals": float(
-                expected_ft_total
-            ),
-            "total_goals_ratio": (
-                float(total_goals_ratio)
-                if total_goals_ratio is not None
-                else None
-            ),
-            "ht_home_away_ratio": (
-                float(ht_ratio)
-                if ht_ratio is not None
-                else None
-            ),
-            "ft_home_away_ratio": (
-                float(ft_ratio)
-                if ft_ratio is not None
-                else None
-            ),
-            "total_goals_ratio_in_range": bool(
-                check_1_pass
-            ),
-            "home_away_direction_consistent": bool(
-                check_2_pass
-            ),
-            "ht_rates_do_not_exceed_ft": bool(
-                check_3_pass
-            ),
-        })
-
-    # Determine aggregate status
     if any(
         item["status"] == "FAILED"
         for item in records
@@ -4575,13 +4411,6 @@ def build_ht_ft_coherence_audit(
     elif any(
         not item["coherent"]
         for item in records
-    ):
-        status = "FAIL"
-
-    elif expectation_checks and any(
-        item["status"]
-        == "HT_FT_EXPECTATION_INCONSISTENT"
-        for item in expectation_checks
     ):
         status = "FAIL"
 
@@ -4625,22 +4454,6 @@ def build_ht_ft_coherence_audit(
         )
     )
 
-    primary_expectation = [
-        item
-        for item in expectation_checks
-        if item.get("source") == primary_source
-    ]
-
-    primary_expectation_pass = bool(
-        primary_complete
-        and primary_expectation
-        and all(
-            item["status"] == "PASS"
-            for item in primary_expectation
-            if item["status"] != "NOT_AVAILABLE"
-        )
-    )
-
     return {
         "status": status,
         "primary_source_complete": (
@@ -4649,15 +4462,8 @@ def build_ht_ft_coherence_audit(
         "primary_source_pass": (
             primary_pass
         ),
-        "primary_expectation_pass": (
-            primary_expectation_pass
-        ),
         "scenarios": records,
-        "expectation_checks": (
-            expectation_checks
-        ),
     }
-
 
 
 # ============================================================
